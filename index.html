@@ -536,7 +536,14 @@ async function openQrScanner(onValidToken){
     return;
   }
   try{
-    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: 'environment',
+        width: { ideal: 960 },
+        height: { ideal: 960 },
+        advanced: [{ focusMode: 'continuous' }]
+      }
+    });
     if(stopped){ stream.getTracks().forEach(t => t.stop()); return; }
     video.srcObject = stream;
     await video.play();
@@ -546,15 +553,25 @@ async function openQrScanner(onValidToken){
     camStatus.textContent = 'Tidak bisa mengakses kamera (' + err.message + '). Gunakan kode manual di bawah.';
   }
 
-  function tick(){
+  const SCAN_MAX_SIDE = 480; // downscale sebelum diproses jsQR biar lebih cepat & lebih sensitif
+  let lastScanAt = 0;
+
+  function tick(now){
     if(stopped) return;
     if(video.readyState === video.HAVE_ENOUGH_DATA){
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const code = window.jsQR ? jsQR(imageData.data, imageData.width, imageData.height) : null;
-      if(code && code.data){ checkToken(code.data); return; }
+      if(!lastScanAt || (now - lastScanAt) >= 80){ // throttle ~12x/detik, cukup untuk QR statis
+        lastScanAt = now;
+        const vw = video.videoWidth, vh = video.videoHeight;
+        const scale = Math.min(1, SCAN_MAX_SIDE / Math.max(vw, vh));
+        canvas.width = Math.round(vw * scale);
+        canvas.height = Math.round(vh * scale);
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const code = window.jsQR
+          ? jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: 'dontInvert' })
+          : null;
+        if(code && code.data){ checkToken(code.data); return; }
+      }
     }
     requestAnimationFrame(tick);
   }
