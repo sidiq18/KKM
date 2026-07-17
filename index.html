@@ -182,6 +182,7 @@ let state = {
   config: null,
   members: [],
   adminSubview: 'rekap',
+  rekapView: 'kesimpulan', // 'kesimpulan' | 'detail'
   currentMember: null,
   errorMsg: null,
   busy: false,
@@ -588,6 +589,36 @@ function statusPill(rec){
   return `<span class="pill pill-green">Hadir</span>`;
 }
 
+/* ---------- kesimpulan harian (gabungan pagi + sore) ---------- */
+function sessionStatus(rec, hasIzin){
+  if(rec) return !rec.valid ? 'invalid' : (rec.late ? 'late' : 'ontime');
+  return hasIzin ? 'izin' : null;
+}
+
+function dailySummaryLabel(pStatus, sStatus){
+  if(pStatus === 'invalid' || sStatus === 'invalid') return { text: 'Luar Radius', pill: 'pill-danger' };
+  if(pStatus === 'izin' && sStatus === 'izin') return { text: 'Izin (Sehari Penuh)', pill: 'pill-muted' };
+  if(pStatus === 'izin' && sStatus === 'ontime') return { text: 'Hadir (Izin Pagi)', pill: 'pill-green' };
+  if(pStatus === 'izin' && sStatus === 'late') return { text: 'Hadir Kesorean (Izin Pagi)', pill: 'pill-clay' };
+  if(pStatus === 'izin' && !sStatus) return { text: 'Izin Pagi', pill: 'pill-muted' };
+  if(sStatus === 'izin' && pStatus === 'ontime') return { text: 'Hadir (Izin Sore)', pill: 'pill-green' };
+  if(sStatus === 'izin' && pStatus === 'late') return { text: 'Hadir tapi Telat (Izin Sore)', pill: 'pill-clay' };
+  if(sStatus === 'izin' && !pStatus) return { text: 'Izin Sore', pill: 'pill-muted' };
+  if(pStatus === 'ontime' && sStatus === 'ontime') return { text: 'Hadir', pill: 'pill-green' };
+  if(pStatus === 'late' && sStatus === 'ontime') return { text: 'Hadir tapi Telat', pill: 'pill-clay' };
+  if(pStatus === 'ontime' && sStatus === 'late') return { text: 'Hadir Kesorean', pill: 'pill-clay' };
+  if(pStatus === 'late' && sStatus === 'late') return { text: 'Hadir tapi Telat (Pagi &amp; Sore)', pill: 'pill-clay' };
+  if(pStatus && !sStatus) return { text: 'Hanya Absen Pagi' + (pStatus === 'late' ? ' (Telat)' : ''), pill: 'pill-muted' };
+  if(sStatus && !pStatus) return { text: 'Hanya Absen Sore' + (sStatus === 'late' ? ' (Telat)' : ''), pill: 'pill-muted' };
+  return { text: '-', pill: 'pill-muted' };
+}
+
+function sesiSubtext(rec, hasIzin, label){
+  if(rec) return `${label}: ${!rec.valid ? 'Luar Radius' : (rec.late ? 'Telat' : 'Hadir')} <span class="mono">${rec.time}</span>`;
+  if(hasIzin) return `${label}: Izin`;
+  return `${label}: -`;
+}
+
 async function openQrScanner(onValidToken){
   const overlay = document.createElement('div');
   overlay.className = 'stamp-overlay';
@@ -791,13 +822,31 @@ async function renderRekap(body){
   }
   rows.sort((a,b) => (a.date+a.period < b.date+b.period ? 1 : -1));
 
-  const flaggedCount = rows.filter(r => r.joki).length;
+  body.innerHTML = '';
 
+  const subTab = document.createElement('div');
+  subTab.className = 'tabbar';
+  subTab.style = 'margin-bottom:12px;';
+  [['kesimpulan','Kesimpulan Harian'],['detail','Detail Per Sesi']].forEach(([key,label]) => {
+    const t = document.createElement('div');
+    t.className = 'tab' + (state.rekapView === key ? ' active' : '');
+    t.textContent = label;
+    t.onclick = () => { state.rekapView = key; renderRekap(body); };
+    subTab.appendChild(t);
+  });
+  body.appendChild(subTab);
+
+  if(state.rekapView === 'kesimpulan') renderRekapKesimpulan(body, rows, approvedIzin);
+  else renderRekapDetail(body, rows);
+}
+
+function renderRekapDetail(body, rows){
+  const flaggedCount = rows.filter(r => r.joki).length;
   const card = document.createElement('div');
   card.className = 'card';
   card.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-      <div class="eyebrow">Rekap Semua Anggota</div>
+      <div class="eyebrow">Detail Per Sesi</div>
       <button class="btn btn-outline" id="btn_export" style="width:auto;padding:8px 12px;font-size:12.5px;">⬇ Export CSV</button>
     </div>
     ${flaggedCount > 0 ? `<div class="banner banner-danger">⚠ Ada ${flaggedCount} absen yang tercatat meski izin sudah disetujui di tanggal &amp; sesi yang sama — cek kemungkinan joki di baris bertanda ⚠ di bawah.</div>` : ''}
@@ -810,11 +859,10 @@ async function renderRekap(body){
           <td class="small">${fmtDate(r.date)}</td>
           <td class="small" style="text-transform:capitalize;">${r.period}</td>
           <td class="mono small">${r.time}</td>
-          <td>${statusPill(r)}${r.joki ? ' <span class="pill pill-danger" title="Ada izin disetujui di tanggal & sesi yang sama">⚠ Cek Joki</span>' : ''}</td>
+          <td>${statusPill(r)}${r.joki ? ' <span class="pill pill-danger" title="Ada izin disetujui di tanggal & sesi yang sama">⚠ CURIGA</span>' : ''}</td>
         </tr>`).join('') +
         `</tbody></table></div>`
   );
-  body.innerHTML = '';
   body.appendChild(card);
 
   document.getElementById('btn_export').onclick = () => {
@@ -828,7 +876,91 @@ async function renderRekap(body){
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = 'rekap-absensi-' + todayStr() + '.csv';
+    a.download = 'rekap-detail-' + todayStr() + '.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+}
+
+function renderRekapKesimpulan(body, rows, approvedIzin){
+  // gabungkan pagi + sore per anggota per tanggal jadi satu kesimpulan kehadiran harian
+  const byKey = {};
+  rows.forEach(r => {
+    const key = r.memberId + '|' + r.date;
+    byKey[key] = byKey[key] || { memberId: r.memberId, name: r.name, date: r.date };
+    byKey[key][r.period] = r;
+  });
+  approvedIzin.forEach(p => {
+    const key = p.memberId + '|' + p.date;
+    byKey[key] = byKey[key] || { memberId: p.memberId, name: p.memberName, date: p.date };
+    if(p.period === 'sehari'){ byKey[key].izinPagi = true; byKey[key].izinSore = true; }
+    else if(p.period === 'pagi') byKey[key].izinPagi = true;
+    else if(p.period === 'sore') byKey[key].izinSore = true;
+  });
+
+  const summaryRows = Object.values(byKey).map(entry => {
+    const pStatus = sessionStatus(entry.pagi, entry.izinPagi);
+    const sStatus = sessionStatus(entry.sore, entry.izinSore);
+    const summary = dailySummaryLabel(pStatus, sStatus);
+    const joki = !!(entry.pagi && entry.pagi.joki) || !!(entry.sore && entry.sore.joki);
+    return { ...entry, pStatus, sStatus, summary, joki };
+  }).sort((a,b) => (a.date+a.name < b.date+b.name ? 1 : -1));
+
+  const flaggedCount = summaryRows.filter(r => r.joki).length;
+
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+      <div class="eyebrow">Kesimpulan Kehadiran Harian</div>
+      <button class="btn btn-outline" id="btn_export_kesimpulan" style="width:auto;padding:8px 12px;font-size:12.5px;">⬇ Export CSV</button>
+    </div>
+    <p class="small muted" style="margin-bottom:10px;">Gabungan sesi pagi &amp; sore jadi satu status harian — ini yang dipakai untuk laporan kehadiran.</p>
+    ${flaggedCount > 0 ? `<div class="banner banner-danger">⚠ Ada ${flaggedCount} hari dengan indikasi joki (absen tercatat meski izin sudah disetujui).</div>` : ''}
+  `;
+  if(summaryRows.length === 0){
+    card.innerHTML += `<div class="empty">Belum ada data absensi.</div>`;
+  } else {
+    summaryRows.forEach(r => {
+      const row = document.createElement('div');
+      row.className = 'member-row';
+      row.style = `align-items:flex-start;flex-direction:column;gap:6px;padding:12px 0;${r.joki ? 'background:var(--danger-light);border-radius:8px;padding-left:8px;padding-right:8px;' : ''}`;
+      row.innerHTML = `
+        <div style="display:flex;justify-content:space-between;width:100%;align-items:flex-start;">
+          <div>
+            <div style="font-weight:700;font-size:14px;">${r.name}</div>
+            <div class="small muted">${fmtDate(r.date)}</div>
+          </div>
+          <div style="text-align:right;">
+            <span class="pill ${r.summary.pill}">${r.summary.text}</span>
+            ${r.joki ? ' <span class="pill pill-danger" title="Ada izin disetujui di tanggal & sesi yang sama">⚠ CURIGA</span>' : ''}
+          </div>
+        </div>
+        <div class="small muted">${sesiSubtext(r.pagi, r.izinPagi, 'Pagi')} &nbsp;·&nbsp; ${sesiSubtext(r.sore, r.izinSore, 'Sore')}</div>
+      `;
+      card.appendChild(row);
+    });
+  }
+  body.appendChild(card);
+
+  document.getElementById('btn_export_kesimpulan').onclick = () => {
+    const header = ['Nama','Tanggal','Kesimpulan','Pagi','JamPagi','Sore','JamSore','IndikasiJoki'];
+    const lines = [header.join(',')];
+    summaryRows.forEach(r => {
+      const pTxt = r.pStatus === 'invalid' ? 'Luar Radius' : r.pStatus === 'late' ? 'Telat' : r.pStatus === 'ontime' ? 'Hadir' : r.pStatus === 'izin' ? 'Izin' : '-';
+      const sTxt = r.sStatus === 'invalid' ? 'Luar Radius' : r.sStatus === 'late' ? 'Telat' : r.sStatus === 'ontime' ? 'Hadir' : r.sStatus === 'izin' ? 'Izin' : '-';
+      lines.push([
+        r.name, r.date, r.summary.text,
+        pTxt, r.pagi ? r.pagi.time : '',
+        sTxt, r.sore ? r.sore.time : '',
+        r.joki ? 'YA' : ''
+      ].map(escCsv).join(','));
+    });
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'rekap-kesimpulan-' + todayStr() + '.csv';
     a.click();
     URL.revokeObjectURL(url);
   };
