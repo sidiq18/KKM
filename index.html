@@ -93,22 +93,19 @@
 <div id="app"></div>
 
 <script>
-// Import the functions you need from the SDKs you need
-import { initializeApp } from "firebase/app";
-import { getAnalytics } from "firebase/analytics";
-// TODO: Add SDKs for Firebase products that you want to use
- //https://firebase.google.com/docs/web/setup#available-libraries
-
-// Initialize Firebase
-
+/* ---------- FIREBASE SETUP ----------
+   Isi konfigurasi project Firebase kamu di sini.
+   Cara dapatnya: console.firebase.google.com -> buat project -> Project settings
+   -> scroll ke "Your apps" -> tambah Web App (</>) -> copy config di bawah ini.
+   Jangan lupa aktifkan Firestore Database (Build > Firestore Database > Create database).
+*/
 const firebaseConfig = {
   apiKey: "AIzaSyDyk9VP55b1StxDCfcss5SbWE0Yz6nIWeM",
   authDomain: "absensi-kkm.firebaseapp.com",
   projectId: "absensi-kkm",
   storageBucket: "absensi-kkm.firebasestorage.app",
   messagingSenderId: "513660198819",
-  appId: "1:513660198819:web:0e5556346cd30cc6438416",
-  measurementId: "G-8MWNNPE4TV"
+  appId: "1:513660198819:web:0e5556346cd30cc6438416"
 };
 let db = null;
 function initFirebase(){
