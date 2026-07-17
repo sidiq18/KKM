@@ -119,6 +119,18 @@ const K_MEMBERS = 'kkm_members';
 const K_PERMITS = 'kkm_permits';
 const attKey = (id) => 'kkm_attendance_' + id;
 
+/* ---------- session persistence (biar refresh tidak logout) ---------- */
+const SESSION_KEY = 'kkm_session';
+function saveSession(session){
+  try{ localStorage.setItem(SESSION_KEY, JSON.stringify(session)); } catch(e){ console.error('gagal simpan sesi', e); }
+}
+function loadSession(){
+  try{ const raw = localStorage.getItem(SESSION_KEY); return raw ? JSON.parse(raw) : null; } catch(e){ return null; }
+}
+function clearSession(){
+  try{ localStorage.removeItem(SESSION_KEY); } catch(e){}
+}
+
 async function sget(key){
   try{
     const snap = await db.collection('kv').doc(key).get();
@@ -206,7 +218,23 @@ async function boot(){
   initFirebase();
   state.config = await sget(K_CONFIG);
   state.members = (await sget(K_MEMBERS)) || [];
-  state.view = 'landing';
+
+  const session = loadSession();
+  if(session && session.role === 'admin' && state.config){
+    state.view = 'adminDashboard';
+    state.adminSubview = 'rekap';
+  } else if(session && session.role === 'member'){
+    const m = state.members.find(x => x.id === session.memberId);
+    if(m){
+      state.currentMember = m;
+      state.view = 'memberDashboard';
+    } else {
+      clearSession();
+      state.view = 'landing';
+    }
+  } else {
+    state.view = 'landing';
+  }
   render();
 }
 
@@ -280,12 +308,13 @@ function elFooter(){
 function renderMemberNoConfig(){
   const wrap = document.createElement('div');
   wrap.appendChild(backLink('Kembali', 'landing'));
-  wrap.innerHTML += `
-    <div class="card">
-      <h3 style="font-size:16px;margin-bottom:8px;">Belum ada data</h3>
-      <p class="small muted">Kelompok ini belum diatur. Minta ketua kelompok untuk melakukan setup awal dan menambahkan nama Anda sebagai anggota.</p>
-    </div>
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = `
+    <h3 style="font-size:16px;margin-bottom:8px;">Belum ada data</h3>
+    <p class="small muted">Kelompok ini belum diatur. Minta ketua kelompok untuk melakukan setup awal dan menambahkan nama Anda sebagai anggota.</p>
   `;
+  wrap.appendChild(card);
   app.appendChild(wrap);
 }
 
@@ -293,9 +322,10 @@ function renderMemberNoConfig(){
 function renderAdminSetup(){
   const wrap = document.createElement('div');
   wrap.appendChild(backLink('Kembali', 'landing'));
-  wrap.innerHTML += `
-    <div class="top"><div class="eyebrow">Setup Awal</div><h1>Atur Kelompok</h1></div>
-  `;
+  const topEl = document.createElement('div');
+  topEl.className = 'top';
+  topEl.innerHTML = `<div class="eyebrow">Setup Awal</div><h1>Atur Kelompok</h1>`;
+  wrap.appendChild(topEl);
   const card = document.createElement('div');
   card.className = 'card stack';
   card.innerHTML = `
@@ -360,6 +390,7 @@ function renderAdminSetup(){
     const config = { name, adminPin, morningStart: ms, morningEnd: me, morningLateEnd: mle, eveningStart: es, eveningEnd: ee, eveningLateEnd: ele, lat, lng, radius };
     await sset(K_CONFIG, config);
     state.config = config;
+    saveSession({ role: 'admin' });
     state.view = 'adminDashboard';
     state.adminSubview = 'anggota';
     render();
@@ -370,7 +401,10 @@ function renderAdminSetup(){
 function renderAdminLogin(){
   const wrap = document.createElement('div');
   wrap.appendChild(backLink('Kembali', 'landing'));
-  wrap.innerHTML += `<div class="top"><div class="eyebrow">Ketua Kelompok</div><h1>Login Admin</h1></div>`;
+  const topEl = document.createElement('div');
+  topEl.className = 'top';
+  topEl.innerHTML = `<div class="eyebrow">Ketua Kelompok</div><h1>Login Admin</h1>`;
+  wrap.appendChild(topEl);
   const card = document.createElement('div');
   card.className = 'card stack';
   card.innerHTML = `
@@ -383,6 +417,7 @@ function renderAdminLogin(){
   document.getElementById('btn_login').onclick = () => {
     const pin = document.getElementById('f_pin').value.trim();
     if(pin === state.config.adminPin){
+      saveSession({ role: 'admin' });
       state.view = 'adminDashboard';
       state.adminSubview = 'rekap';
       render();
@@ -396,7 +431,10 @@ function renderAdminLogin(){
 function renderMemberLogin(){
   const wrap = document.createElement('div');
   wrap.appendChild(backLink('Kembali', 'landing'));
-  wrap.innerHTML += `<div class="top"><div class="eyebrow">Anggota</div><h1>Login</h1></div>`;
+  const topEl = document.createElement('div');
+  topEl.className = 'top';
+  topEl.innerHTML = `<div class="eyebrow">Anggota</div><h1>Login</h1>`;
+  wrap.appendChild(topEl);
   const card = document.createElement('div');
   card.className = 'card stack';
   const opts = state.members.map(m => `<option value="${m.id}">${m.name}</option>`).join('');
@@ -414,6 +452,7 @@ function renderMemberLogin(){
     const m = state.members.find(x => x.id === id);
     if(m && pin === m.pin){
       state.currentMember = m;
+      saveSession({ role: 'member', memberId: m.id });
       state.view = 'memberDashboard';
       render();
     } else {
@@ -434,7 +473,7 @@ async function renderMemberDashboard(){
   logoutBtn.className = 'btn btn-ghost';
   logoutBtn.style = 'width:auto;padding:8px 12px;';
   logoutBtn.textContent = 'Keluar';
-  logoutBtn.onclick = () => { state.currentMember = null; state.view = 'landing'; render(); };
+  logoutBtn.onclick = () => { state.currentMember = null; clearSession(); state.view = 'landing'; render(); };
   topBar.appendChild(logoutBtn);
   wrap.appendChild(topBar);
 
@@ -625,7 +664,7 @@ async function openQrScanner(onValidToken){
   overlay.innerHTML = `
     <div class="stamp-card" style="max-width:340px;">
       <div class="eyebrow" style="margin-bottom:8px;">Pindai QR Absen</div>
-      <div class="qr-video-wrap"><video id="qr_video" playsinline muted></video></div>
+      <div class="qr-video-wrap"><video id="qr_video" playsinline autoplay muted></video></div>
       <div id="qr_cam_status" class="small muted" style="margin-top:10px;">Mengaktifkan kamera…</div>
       <div style="margin-top:14px;text-align:left;">
         <label>Atau masukkan kode manual</label>
@@ -667,26 +706,46 @@ async function openQrScanner(onValidToken){
   }
   document.getElementById('btn_qr_manual').onclick = () => checkToken(document.getElementById('qr_manual').value);
 
+  if(location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1'){
+    camStatus.textContent = 'Kamera hanya bisa diakses lewat HTTPS (halaman ini dibuka lewat koneksi tidak aman). Gunakan kode manual di bawah, atau minta admin hosting halaman ini via HTTPS.';
+    return;
+  }
   if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
     camStatus.textContent = 'Kamera tidak tersedia di perangkat/browser ini. Gunakan kode manual di bawah.';
     return;
   }
-  try{
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: 'environment',
-        width: { ideal: 960 },
-        height: { ideal: 960 },
-        advanced: [{ focusMode: 'continuous' }]
-      }
-    });
+
+  async function startCamera(constraints){
+    stream = await navigator.mediaDevices.getUserMedia(constraints);
     if(stopped){ stream.getTracks().forEach(t => t.stop()); return; }
     video.srcObject = stream;
-    await video.play();
+    try{ await video.play(); } catch(e){ /* beberapa browser sudah autoplay lewat atribut, abaikan error play() */ }
     camStatus.textContent = 'Arahkan kamera ke QR di lokasi KKM…';
     requestAnimationFrame(tick);
+  }
+
+  try{
+    await startCamera({
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 960 },
+        height: { ideal: 960 }
+      }
+    });
   } catch(err){
-    camStatus.textContent = 'Tidak bisa mengakses kamera (' + err.message + '). Gunakan kode manual di bawah.';
+    // fallback: coba constraint kamera paling sederhana (mis. laptop tanpa kamera belakang, atau constraint spesifik ditolak)
+    try{
+      camStatus.textContent = 'Mencoba mode kamera lain…';
+      await startCamera({ video: true });
+    } catch(err2){
+      if(err2.name === 'NotAllowedError' || err.name === 'NotAllowedError'){
+        camStatus.textContent = 'Izin kamera ditolak. Aktifkan izin kamera untuk situs ini di pengaturan browser, atau gunakan kode manual di bawah.';
+      } else if(err2.name === 'NotFoundError' || err.name === 'NotFoundError'){
+        camStatus.textContent = 'Tidak ada kamera terdeteksi di perangkat ini. Gunakan kode manual di bawah.';
+      } else {
+        camStatus.textContent = 'Tidak bisa mengakses kamera (' + err2.message + '). Gunakan kode manual di bawah.';
+      }
+    }
   }
 
   const SCAN_MAX_SIDE = 480; // downscale sebelum diproses jsQR biar lebih cepat & lebih sensitif
@@ -780,7 +839,7 @@ function renderAdminDashboard(){
   logoutBtn.className = 'btn btn-ghost';
   logoutBtn.style = 'width:auto;padding:8px 12px;';
   logoutBtn.textContent = 'Keluar';
-  logoutBtn.onclick = () => { state.view = 'landing'; render(); };
+  logoutBtn.onclick = () => { clearSession(); state.view = 'landing'; render(); };
   topBar.appendChild(logoutBtn);
   wrap.appendChild(topBar);
 
