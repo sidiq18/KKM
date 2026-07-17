@@ -116,6 +116,7 @@ function initFirebase(){
 /* ---------- storage helpers (Firestore-backed, same key/value shape as before) ---------- */
 const K_CONFIG = 'kkm_config';
 const K_MEMBERS = 'kkm_members';
+const K_PERMITS = 'kkm_permits';
 const attKey = (id) => 'kkm_attendance_' + id;
 
 async function sget(key){
@@ -153,11 +154,22 @@ function haversine(lat1,lng1,lat2,lng2){
   const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLng/2)**2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
 }
-function getPeriod(config, hm){
+function getPeriodStatus(config, hm){
   hm = hm || nowHM();
-  if(hm >= config.morningStart && hm <= config.morningEnd) return 'pagi';
-  if(hm >= config.eveningStart && hm <= config.eveningEnd) return 'sore';
-  return null;
+  // fallback ke *End kalau config lama belum punya field *LateEnd, biar tidak error
+  const mLateEnd = config.morningLateEnd || config.morningEnd;
+  const eLateEnd = config.eveningLateEnd || config.eveningEnd;
+  if(hm >= config.morningStart && hm <= config.morningEnd) return { period: 'pagi', status: 'ontime' };
+  if(hm > config.morningEnd && hm <= mLateEnd) return { period: 'pagi', status: 'late' };
+  if(hm >= config.eveningStart && hm <= config.eveningEnd) return { period: 'sore', status: 'ontime' };
+  if(hm > config.eveningEnd && hm <= eLateEnd) return { period: 'sore', status: 'late' };
+  return { period: null, status: null };
+}
+function findApprovedIzin(permits, memberId, date, period){
+  return (permits || []).find(p =>
+    p.memberId === memberId && p.date === date && p.status === 'disetujui' &&
+    (p.period === 'sehari' || p.period === period)
+  );
 }
 function escCsv(v){
   const s = String(v ?? '');
@@ -290,12 +302,14 @@ function renderAdminSetup(){
     <div class="field"><label>Buat PIN Admin (untuk Anda, ketua kelompok)</label><input id="f_adminpin" placeholder="mis. 190400" inputmode="numeric"></div>
     <div class="row">
       <div class="field" style="flex:1;"><label>Mulai Absen Pagi</label><input id="f_ms" type="time" value="06:00"></div>
-      <div class="field" style="flex:1;"><label>Selesai Absen Pagi</label><input id="f_me" type="time" value="10:00"></div>
+      <div class="field" style="flex:1;"><label>Selesai Tepat Waktu Pagi</label><input id="f_me" type="time" value="08:00"></div>
     </div>
+    <div class="field"><label>Batas Akhir Telat Pagi (lewat ini dianggap tidak hadir)</label><input id="f_mle" type="time" value="12:00"></div>
     <div class="row">
       <div class="field" style="flex:1;"><label>Mulai Absen Sore</label><input id="f_es" type="time" value="15:00"></div>
-      <div class="field" style="flex:1;"><label>Selesai Absen Sore</label><input id="f_ee" type="time" value="19:00"></div>
+      <div class="field" style="flex:1;"><label>Selesai Tepat Waktu Sore</label><input id="f_ee" type="time" value="17:00"></div>
     </div>
+    <div class="field"><label>Batas Akhir Telat Sore (lewat ini dianggap tidak hadir)</label><input id="f_ele" type="time" value="19:00"></div>
     <div class="field">
       <label>Titik Lokasi KKM</label>
       <button class="btn btn-outline" id="btn_locate" type="button">📍 Gunakan Lokasi Saat Ini</button>
@@ -331,16 +345,18 @@ function renderAdminSetup(){
     const name = document.getElementById('f_name').value.trim();
     const adminPin = document.getElementById('f_adminpin').value.trim();
     const ms = document.getElementById('f_ms').value, me = document.getElementById('f_me').value;
+    const mle = document.getElementById('f_mle').value;
     const es = document.getElementById('f_es').value, ee = document.getElementById('f_ee').value;
+    const ele = document.getElementById('f_ele').value;
     const lat = parseFloat(document.getElementById('f_lat').value);
     const lng = parseFloat(document.getElementById('f_lng').value);
     const radius = parseInt(document.getElementById('f_radius').value, 10);
     const errEl = document.getElementById('setup_err');
-    if(!name || !adminPin || !ms || !me || !es || !ee || isNaN(lat) || isNaN(lng) || isNaN(radius)){
+    if(!name || !adminPin || !ms || !me || !mle || !es || !ee || !ele || isNaN(lat) || isNaN(lng) || isNaN(radius)){
       errEl.innerHTML = '<div class="banner banner-danger">Lengkapi semua data, termasuk lokasi.</div>';
       return;
     }
-    const config = { name, adminPin, morningStart: ms, morningEnd: me, eveningStart: es, eveningEnd: ee, lat, lng, radius };
+    const config = { name, adminPin, morningStart: ms, morningEnd: me, morningLateEnd: mle, eveningStart: es, eveningEnd: ee, eveningLateEnd: ele, lat, lng, radius };
     await sset(K_CONFIG, config);
     state.config = config;
     state.view = 'adminDashboard';
@@ -422,27 +438,43 @@ async function renderMemberDashboard(){
   wrap.appendChild(topBar);
 
   const records = (await sget(attKey(state.currentMember.id))) || [];
+  const permits = (await sget(K_PERMITS)) || [];
   const todayRecs = records.filter(r => r.date === todayStr());
 
   const scanCard = document.createElement('div');
   scanCard.className = 'card';
-  const period = getPeriod(state.config);
+  const { period, status: periodStatus } = getPeriodStatus(state.config);
   const alreadyForPeriod = period ? todayRecs.find(r => r.period === period) : null;
+  const izinPagi = findApprovedIzin(permits, state.currentMember.id, todayStr(), 'pagi');
+  const izinSore = findApprovedIzin(permits, state.currentMember.id, todayStr(), 'sore');
+  const approvedIzinForCurrentPeriod = period === 'pagi' ? izinPagi : (period === 'sore' ? izinSore : null);
 
   let btnLabel = 'Absen Sekarang';
   let btnDisabled = false;
+  let btnClass = 'btn-primary';
   if(!period){ btnDisabled = true; btnLabel = 'Belum Waktu Absen'; }
-  else if(alreadyForPeriod){ btnDisabled = true; btnLabel = 'Sudah Absen ' + (period === 'pagi' ? 'Pagi' : 'Sore'); }
+  else if(alreadyForPeriod){
+    btnDisabled = true;
+    btnLabel = 'Sudah Absen ' + (period === 'pagi' ? 'Pagi' : 'Sore') + (alreadyForPeriod.late ? ' (Telat)' : '');
+  } else if(approvedIzinForCurrentPeriod){
+    btnDisabled = true;
+    btnLabel = 'Sedang Izin ' + (period === 'pagi' ? 'Pagi' : 'Sore');
+  } else if(periodStatus === 'late'){
+    btnLabel = 'Absen Sekarang (Telat)';
+    btnClass = 'btn-clay';
+  }
 
   scanCard.innerHTML = `
     <div class="eyebrow" style="margin-bottom:10px;">Absen Hari Ini · ${fmtDate(todayStr())}</div>
-    ${periodCardHtml('pagi', todayRecs, state.config)}
-    ${periodCardHtml('sore', todayRecs, state.config)}
-    <button class="btn ${btnDisabled ? 'btn-outline' : 'btn-primary'}" id="btn_scan" ${btnDisabled ? 'disabled' : ''} style="margin-top:6px;">${btnLabel}</button>
+    ${periodCardHtml('pagi', todayRecs, state.config, izinPagi)}
+    ${periodCardHtml('sore', todayRecs, state.config, izinSore)}
+    <button class="btn ${btnDisabled ? 'btn-outline' : btnClass}" id="btn_scan" ${btnDisabled ? 'disabled' : ''} style="margin-top:6px;">${btnLabel}</button>
     <div class="small muted" style="margin-top:8px;">${btnDisabled ? '' : 'Anda akan diminta memindai QR di lokasi, lalu izin lokasi.'}</div>
     <div id="scan_status" class="small muted" style="margin-top:4px;"></div>
   `;
   wrap.appendChild(scanCard);
+
+  wrap.appendChild(renderIzinCardMember(permits));
 
   const histCard = document.createElement('div');
   histCard.className = 'card';
@@ -467,20 +499,93 @@ async function renderMemberDashboard(){
   }
 }
 
-function periodCardHtml(period, todayRecs, config){
+/* ---------- MEMBER: kartu ajukan & riwayat izin ---------- */
+function renderIzinCardMember(permits){
+  const card = document.createElement('div');
+  card.className = 'card';
+  const myPermits = permits
+    .filter(p => p.memberId === state.currentMember.id)
+    .sort((a,b) => (a.date < b.date ? 1 : -1));
+
+  card.innerHTML = `
+    <div class="eyebrow" style="margin-bottom:10px;">Ajukan Izin</div>
+    <div class="field"><label>Tanggal</label><input id="f_izin_date" type="date" value="${todayStr()}"></div>
+    <div class="field"><label>Sesi</label>
+      <select id="f_izin_period">
+        <option value="sehari">Sehari Penuh (Pagi &amp; Sore)</option>
+        <option value="pagi">Pagi saja</option>
+        <option value="sore">Sore saja</option>
+      </select>
+    </div>
+    <div class="field"><label>Alasan</label><input id="f_izin_reason" placeholder="mis. Sakit, ada urusan keluarga, dll."></div>
+    <div id="izin_form_err"></div>
+    <button class="btn btn-outline" id="btn_izin_submit">Kirim Pengajuan Izin</button>
+    <div style="margin-top:16px;">
+      <div class="eyebrow" style="margin-bottom:8px;">Riwayat Izin Saya</div>
+      ${myPermits.length === 0 ? `<div class="empty">Belum pernah mengajukan izin.</div>` :
+        myPermits.map(p => `
+          <div class="member-row">
+            <div>
+              <div style="font-weight:600;font-size:13.5px;">${fmtDate(p.date)} · ${p.period === 'sehari' ? 'Sehari Penuh' : (p.period === 'pagi' ? 'Pagi' : 'Sore')}</div>
+              <div class="small muted">${p.reason}</div>
+            </div>
+            ${izinStatusPill(p)}
+          </div>
+        `).join('')
+      }
+    </div>
+  `;
+
+  card.querySelector('#btn_izin_submit').onclick = async () => {
+    const date = card.querySelector('#f_izin_date').value;
+    const period = card.querySelector('#f_izin_period').value;
+    const reason = card.querySelector('#f_izin_reason').value.trim();
+    const errEl = card.querySelector('#izin_form_err');
+    if(!date || !reason){
+      errEl.innerHTML = '<div class="banner banner-danger" style="margin-top:8px;">Lengkapi tanggal dan alasan izin.</div>';
+      return;
+    }
+    const fresh = (await sget(K_PERMITS)) || [];
+    const permit = {
+      id: genId(),
+      memberId: state.currentMember.id,
+      memberName: state.currentMember.name,
+      date, period, reason,
+      status: 'pending',
+      createdAt: todayStr() + ' ' + nowHMS(),
+      decidedAt: null,
+    };
+    await sset(K_PERMITS, [...fresh, permit]);
+    render();
+  };
+
+  return card;
+}
+
+function izinStatusPill(p){
+  if(p.status === 'disetujui') return `<span class="pill pill-green">Disetujui</span>`;
+  if(p.status === 'ditolak') return `<span class="pill pill-danger">Ditolak</span>`;
+  return `<span class="pill pill-muted">Menunggu</span>`;
+}
+
+function periodCardHtml(period, todayRecs, config, approvedIzin){
   const rec = todayRecs.find(r => r.period === period);
   const label = period === 'pagi' ? 'Pagi' : 'Sore';
-  const window = period === 'pagi' ? `${config.morningStart}–${config.morningEnd}` : `${config.eveningStart}–${config.eveningEnd}`;
+  const start = period === 'pagi' ? config.morningStart : config.eveningStart;
+  const end = period === 'pagi' ? config.morningEnd : config.eveningEnd;
+  const lateEnd = (period === 'pagi' ? config.morningLateEnd : config.eveningLateEnd) || end;
+  const window = `${start}–${end}` + (lateEnd !== end ? ` <span class="muted">(telat s.d ${lateEnd})</span>` : '');
   let right;
   if(rec) right = statusPill(rec) + ` <span class="mono small muted">${rec.time}</span>`;
+  else if(approvedIzin) right = `<span class="pill pill-muted">Izin</span>`;
   else right = `<span class="pill pill-muted">${window}</span>`;
   return `<div class="period-card"><div class="label">${label}</div><div>${right}</div></div>`;
 }
 
 function statusPill(rec){
-  return rec.valid
-    ? `<span class="pill pill-green">Hadir</span>`
-    : `<span class="pill pill-danger">Luar Radius</span>`;
+  if(!rec.valid) return `<span class="pill pill-danger">Luar Radius</span>`;
+  if(rec.late) return `<span class="pill pill-clay">Telat</span>`;
+  return `<span class="pill pill-green">Hadir</span>`;
 }
 
 async function openQrScanner(onValidToken){
@@ -589,14 +694,15 @@ async function finalizeScan(existingRecords){
   }
   navigator.geolocation.getCurrentPosition(
     async pos => {
-      const period = getPeriod(state.config);
+      const { period, status: periodStatus } = getPeriodStatus(state.config);
       if(!period){ statusEl.textContent = 'Waktu absen sudah berakhir.'; btn.disabled = false; return; }
       const dist = haversine(pos.coords.latitude, pos.coords.longitude, state.config.lat, state.config.lng);
       const valid = dist <= state.config.radius;
       const record = {
         date: todayStr(), period, time: nowHMS(),
         lat: pos.coords.latitude, lng: pos.coords.longitude,
-        distance: Math.round(dist), valid
+        distance: Math.round(dist), valid,
+        late: periodStatus === 'late'
       };
       const updated = [...existingRecords, record];
       await sset(attKey(state.currentMember.id), updated);
@@ -614,12 +720,15 @@ function showStamp(record){
   const overlay = document.createElement('div');
   overlay.className = 'stamp-overlay';
   const label = record.period === 'pagi' ? 'PAGI' : 'SORE';
+  const stampWord = !record.valid ? 'DI LUAR<br>RADIUS' : (record.late ? 'HADIR<br>(TELAT)' : 'HADIR');
+  const titleWord = !record.valid ? 'Absen ' + label + ' Tercatat' : (record.late ? 'Absen ' + label + ' Tercatat (Telat)' : 'Absen ' + label + ' Berhasil');
   overlay.innerHTML = `
     <div class="stamp-card">
-      <div class="stamp ${record.valid ? 'ok' : 'bad'}"><span>${record.valid ? 'HADIR' : 'DI LUAR<br>RADIUS'}</span></div>
-      <h3 style="font-size:18px;">${record.valid ? 'Absen ' + label + ' Berhasil' : 'Absen ' + label + ' Tercatat'}</h3>
+      <div class="stamp ${record.valid ? (record.late ? 'bad' : 'ok') : 'bad'}"><span>${stampWord}</span></div>
+      <h3 style="font-size:18px;">${titleWord}</h3>
       <p class="small muted mono" style="margin-top:6px;">${record.time} · jarak ${record.distance}m</p>
       ${!record.valid ? '<p class="small" style="margin-top:8px;color:var(--danger);">Anda berada di luar radius ' + state.config.radius + 'm dari titik KKM.</p>' : ''}
+      ${record.valid && record.late ? '<p class="small" style="margin-top:8px;color:var(--accent-clay);">Absen tercatat, tapi di luar jam tepat waktu.</p>' : ''}
       <button class="btn btn-primary" id="btn_close_stamp" style="margin-top:18px;">Tutup</button>
     </div>
   `;
@@ -646,7 +755,7 @@ function renderAdminDashboard(){
 
   const tabbar = document.createElement('div');
   tabbar.className = 'tabbar';
-  const tabs = [['rekap','Rekap'],['anggota','Anggota'],['qr','QR Absen'],['pengaturan','Pengaturan']];
+  const tabs = [['rekap','Rekap'],['izin','Izin'],['anggota','Anggota'],['qr','QR Absen'],['pengaturan','Pengaturan']];
   tabs.forEach(([key,label]) => {
     const t = document.createElement('div');
     t.className = 'tab' + (state.adminSubview === key ? ' active' : '');
@@ -661,6 +770,7 @@ function renderAdminDashboard(){
   app.appendChild(wrap);
 
   if(state.adminSubview === 'rekap') renderRekap(body);
+  else if(state.adminSubview === 'izin') renderIzinAdmin(body);
   else if(state.adminSubview === 'anggota') renderAnggota(body);
   else if(state.adminSubview === 'qr') renderQr(body);
   else renderPengaturan(body);
@@ -668,12 +778,20 @@ function renderAdminDashboard(){
 
 async function renderRekap(body){
   body.innerHTML = `<div class="empty">Memuat rekap…</div>`;
+  const permits = (await sget(K_PERMITS)) || [];
+  const approvedIzin = permits.filter(p => p.status === 'disetujui');
+
   const rows = [];
   for(const m of state.members){
     const recs = (await sget(attKey(m.id))) || [];
-    recs.forEach(r => rows.push({ name: m.name, ...r }));
+    recs.forEach(r => {
+      const flagged = !!findApprovedIzin(approvedIzin, m.id, r.date, r.period);
+      rows.push({ name: m.name, memberId: m.id, ...r, joki: flagged });
+    });
   }
   rows.sort((a,b) => (a.date+a.period < b.date+b.period ? 1 : -1));
+
+  const flaggedCount = rows.filter(r => r.joki).length;
 
   const card = document.createElement('div');
   card.className = 'card';
@@ -682,16 +800,17 @@ async function renderRekap(body){
       <div class="eyebrow">Rekap Semua Anggota</div>
       <button class="btn btn-outline" id="btn_export" style="width:auto;padding:8px 12px;font-size:12.5px;">⬇ Export CSV</button>
     </div>
+    ${flaggedCount > 0 ? `<div class="banner banner-danger">⚠ Ada ${flaggedCount} absen yang tercatat meski izin sudah disetujui di tanggal &amp; sesi yang sama — cek kemungkinan joki di baris bertanda ⚠ di bawah.</div>` : ''}
   ` + (
     rows.length === 0
       ? `<div class="empty">Belum ada data absensi.</div>`
       : `<div style="overflow-x:auto;"><table><thead><tr><th>Nama</th><th>Tgl</th><th>Periode</th><th>Jam</th><th>Status</th></tr></thead><tbody>` +
-        rows.map(r => `<tr>
+        rows.map(r => `<tr style="${r.joki ? 'background:var(--danger-light);' : ''}">
           <td>${r.name}</td>
           <td class="small">${fmtDate(r.date)}</td>
           <td class="small" style="text-transform:capitalize;">${r.period}</td>
           <td class="mono small">${r.time}</td>
-          <td>${statusPill(r)}</td>
+          <td>${statusPill(r)}${r.joki ? ' <span class="pill pill-danger" title="Ada izin disetujui di tanggal & sesi yang sama">⚠ Cek Joki</span>' : ''}</td>
         </tr>`).join('') +
         `</tbody></table></div>`
   );
@@ -699,10 +818,11 @@ async function renderRekap(body){
   body.appendChild(card);
 
   document.getElementById('btn_export').onclick = () => {
-    const header = ['Nama','Tanggal','Periode','Jam','Status','Jarak(m)','Latitude','Longitude'];
+    const header = ['Nama','Tanggal','Periode','Jam','Status','Jarak(m)','Latitude','Longitude','IndikasiJoki'];
     const lines = [header.join(',')];
     rows.forEach(r => {
-      lines.push([r.name, r.date, r.period, r.time, r.valid ? 'Hadir' : 'Luar Radius', r.distance, r.lat, r.lng].map(escCsv).join(','));
+      const status = !r.valid ? 'Luar Radius' : (r.late ? 'Telat' : 'Hadir');
+      lines.push([r.name, r.date, r.period, r.time, status, r.distance, r.lat, r.lng, r.joki ? 'YA' : ''].map(escCsv).join(','));
     });
     const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
@@ -712,6 +832,68 @@ async function renderRekap(body){
     a.click();
     URL.revokeObjectURL(url);
   };
+}
+
+async function renderIzinAdmin(body){
+  body.innerHTML = `<div class="empty">Memuat data izin…</div>`;
+  const permits = (await sget(K_PERMITS)) || [];
+  const pending = permits.filter(p => p.status === 'pending').sort((a,b) => (a.date < b.date ? 1 : -1));
+  const history = permits.filter(p => p.status !== 'pending').sort((a,b) => (a.date < b.date ? 1 : -1));
+
+  body.innerHTML = '';
+
+  const pendingCard = document.createElement('div');
+  pendingCard.className = 'card';
+  pendingCard.innerHTML = `<div class="eyebrow" style="margin-bottom:10px;">Menunggu Persetujuan (${pending.length})</div>` + (
+    pending.length === 0 ? `<div class="empty">Tidak ada pengajuan izin yang menunggu.</div>` : ''
+  );
+  pending.forEach(p => {
+    const row = document.createElement('div');
+    row.className = 'member-row';
+    row.style = 'align-items:flex-start;flex-direction:column;gap:8px;padding:12px 0;';
+    row.innerHTML = `
+      <div style="width:100%;">
+        <div style="font-weight:700;font-size:14px;">${p.memberName}</div>
+        <div class="small muted">${fmtDate(p.date)} · ${p.period === 'sehari' ? 'Sehari Penuh' : (p.period === 'pagi' ? 'Pagi' : 'Sore')}</div>
+        <div class="small" style="margin-top:4px;">${p.reason}</div>
+      </div>
+      <div class="row" style="width:100%;">
+        <button class="btn btn-primary" data-act="approve" style="padding:9px 12px;font-size:13px;">Setujui</button>
+        <button class="btn btn-danger" data-act="reject" style="padding:9px 12px;font-size:13px;">Tolak</button>
+      </div>
+    `;
+    row.querySelector('[data-act="approve"]').onclick = async () => {
+      const fresh = (await sget(K_PERMITS)) || [];
+      const updated = fresh.map(x => x.id === p.id ? { ...x, status: 'disetujui', decidedAt: todayStr() + ' ' + nowHMS() } : x);
+      await sset(K_PERMITS, updated);
+      renderIzinAdmin(body);
+    };
+    row.querySelector('[data-act="reject"]').onclick = async () => {
+      const fresh = (await sget(K_PERMITS)) || [];
+      const updated = fresh.map(x => x.id === p.id ? { ...x, status: 'ditolak', decidedAt: todayStr() + ' ' + nowHMS() } : x);
+      await sset(K_PERMITS, updated);
+      renderIzinAdmin(body);
+    };
+    pendingCard.appendChild(row);
+  });
+  body.appendChild(pendingCard);
+
+  const historyCard = document.createElement('div');
+  historyCard.className = 'card';
+  historyCard.innerHTML = `<div class="eyebrow" style="margin-bottom:6px;">Riwayat Izin</div>` + (
+    history.length === 0
+      ? `<div class="empty">Belum ada riwayat izin.</div>`
+      : history.map(p => `
+        <div class="member-row">
+          <div>
+            <div style="font-weight:600;font-size:14px;">${p.memberName}</div>
+            <div class="small muted">${fmtDate(p.date)} · ${p.period === 'sehari' ? 'Sehari Penuh' : (p.period === 'pagi' ? 'Pagi' : 'Sore')} · ${p.reason}</div>
+          </div>
+          ${izinStatusPill(p)}
+        </div>
+      `).join('')
+  );
+  body.appendChild(historyCard);
 }
 
 function renderAnggota(body){
@@ -818,12 +1000,14 @@ function renderPengaturan(body){
     <div class="field"><label>PIN Admin</label><input id="f_adminpin" value="${c.adminPin}"></div>
     <div class="row">
       <div class="field" style="flex:1;"><label>Mulai Pagi</label><input id="f_ms" type="time" value="${c.morningStart}"></div>
-      <div class="field" style="flex:1;"><label>Selesai Pagi</label><input id="f_me" type="time" value="${c.morningEnd}"></div>
+      <div class="field" style="flex:1;"><label>Selesai Tepat Waktu Pagi</label><input id="f_me" type="time" value="${c.morningEnd}"></div>
     </div>
+    <div class="field"><label>Batas Akhir Telat Pagi</label><input id="f_mle" type="time" value="${c.morningLateEnd || c.morningEnd}"></div>
     <div class="row">
       <div class="field" style="flex:1;"><label>Mulai Sore</label><input id="f_es" type="time" value="${c.eveningStart}"></div>
-      <div class="field" style="flex:1;"><label>Selesai Sore</label><input id="f_ee" type="time" value="${c.eveningEnd}"></div>
+      <div class="field" style="flex:1;"><label>Selesai Tepat Waktu Sore</label><input id="f_ee" type="time" value="${c.eveningEnd}"></div>
     </div>
+    <div class="field"><label>Batas Akhir Telat Sore</label><input id="f_ele" type="time" value="${c.eveningLateEnd || c.eveningEnd}"></div>
     <div class="field">
       <label>Titik Lokasi KKM</label>
       <button class="btn btn-outline" id="btn_locate" type="button">📍 Perbarui dengan Lokasi Saat Ini</button>
@@ -859,8 +1043,10 @@ function renderPengaturan(body){
       adminPin: document.getElementById('f_adminpin').value.trim(),
       morningStart: document.getElementById('f_ms').value,
       morningEnd: document.getElementById('f_me').value,
+      morningLateEnd: document.getElementById('f_mle').value,
       eveningStart: document.getElementById('f_es').value,
       eveningEnd: document.getElementById('f_ee').value,
+      eveningLateEnd: document.getElementById('f_ele').value,
       lat: parseFloat(document.getElementById('f_lat').value),
       lng: parseFloat(document.getElementById('f_lng').value),
       radius: parseInt(document.getElementById('f_radius').value, 10),
