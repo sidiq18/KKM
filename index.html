@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700;12..96,800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js" onerror="window.__jsQrLoadFailed = true;"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <style>
@@ -745,7 +745,9 @@ async function openQrScanner(onValidToken){
       const img = new Image();
       img.onload = () => {
         if(!window.jsQR){
-          fileStatus.textContent = 'Pembaca QR belum siap, coba lagi sebentar lagi.';
+          fileStatus.textContent = window.__jsQrLoadFailed
+            ? 'Gagal memuat pembaca QR (masalah koneksi/CDN). Coba muat ulang halaman, atau pastikan internet stabil.'
+            : 'Pembaca QR belum siap, coba lagi sebentar lagi.';
           return;
         }
         const fc = document.createElement('canvas');
