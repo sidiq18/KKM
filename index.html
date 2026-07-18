@@ -697,7 +697,15 @@ async function openQrScanner(onValidToken){
     const errEl = document.getElementById('qr_err');
     const fresh = await sget(K_CONFIG);
     const val = (value || '').trim().toUpperCase();
-    if(fresh && fresh.qrToken && val === fresh.qrToken.toUpperCase()){
+    if(!fresh){
+      if(errEl) errEl.innerHTML = '<div class="banner banner-danger" style="margin-top:8px;">Gagal mengambil data konfigurasi dari server. Cek koneksi internet lalu coba lagi.</div>';
+      return;
+    }
+    if(!fresh.qrToken){
+      if(errEl) errEl.innerHTML = '<div class="banner banner-danger" style="margin-top:8px;">Admin belum membuat QR absen hari ini. Minta admin buka tab "QR Absen".</div>';
+      return;
+    }
+    if(val === fresh.qrToken.toUpperCase()){
       cleanup();
       onValidToken();
     } else if(errEl){
@@ -719,7 +727,15 @@ async function openQrScanner(onValidToken){
     stream = await navigator.mediaDevices.getUserMedia(constraints);
     if(stopped){ stream.getTracks().forEach(t => t.stop()); return; }
     video.srcObject = stream;
-    try{ await video.play(); } catch(e){ /* beberapa browser sudah autoplay lewat atribut, abaikan error play() */ }
+    video.muted = true;
+    video.playsInline = true;
+    const tryPlay = () => { video.play().catch(()=>{}); };
+    video.onloadedmetadata = tryPlay;
+    video.oncanplay = tryPlay;
+    tryPlay();
+    // jaga-jaga: beberapa browser mobile butuh dorongan play() ulang setelah stream benar-benar siap
+    setTimeout(tryPlay, 300);
+    setTimeout(tryPlay, 1000);
     camStatus.textContent = 'Arahkan kamera ke QR di lokasi KKM…';
     requestAnimationFrame(tick);
   }
@@ -753,7 +769,7 @@ async function openQrScanner(onValidToken){
 
   function tick(now){
     if(stopped) return;
-    if(video.readyState === video.HAVE_ENOUGH_DATA){
+    if(video.readyState >= video.HAVE_CURRENT_DATA && video.videoWidth > 0 && video.videoHeight > 0){
       if(!lastScanAt || (now - lastScanAt) >= 80){ // throttle ~12x/detik, cukup untuk QR statis
         lastScanAt = now;
         const vw = video.videoWidth, vh = video.videoHeight;
