@@ -808,24 +808,39 @@ async function finalizeScan(existingRecords){
   const btn = document.getElementById('btn_scan');
   btn.disabled = true;
   statusEl.textContent = 'QR terverifikasi. Mengambil lokasi…';
+  
   if(!navigator.geolocation){
     statusEl.textContent = 'Perangkat tidak mendukung geolocation.';
     btn.disabled = false;
     return;
   }
+  
   navigator.geolocation.getCurrentPosition(
     async pos => {
       const { period, status: periodStatus } = getPeriodStatus(state.config);
-      if(!period){ statusEl.textContent = 'Waktu absen sudah berakhir.'; btn.disabled = false; return; }
+      if(!period){ 
+        statusEl.textContent = 'Waktu absen sudah berakhir.'; 
+        btn.disabled = false; 
+        return; 
+      }
+      
       const dist = haversine(pos.coords.latitude, pos.coords.longitude, state.config.lat, state.config.lng);
       const valid = dist <= state.config.radius;
+      
       const record = {
-        date: todayStr(), period, time: nowHMS(),
-        lat: pos.coords.latitude, lng: pos.coords.longitude,
-        distance: Math.round(dist), valid,
+        date: todayStr(), 
+        period, 
+        time: nowHMS(),
+        lat: pos.coords.latitude, 
+        lng: pos.coords.longitude,
+        distance: Math.round(dist), 
+        valid,
         late: periodStatus === 'late'
       };
+      
       const updated = [...existingRecords, record];
+      
+      // Menggunakan sset yang menyimpan data array absen terbaru ke Firestore
       await sset(attKey(state.currentMember.id), updated);
       showStamp(record);
     },
