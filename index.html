@@ -154,6 +154,17 @@ function genPin(){ return String(Math.floor(1000 + Math.random()*9000)); }
 function genQrToken(){
   return Math.random().toString(36).slice(2,6).toUpperCase() + '-' + Math.random().toString(36).slice(2,6).toUpperCase();
 }
+/* Pastikan token QR hari ini sudah ada, tanpa perlu admin membuka tab "QR Absen" secara manual. */
+async function ensureTodayQrToken(){
+  const fresh = (await sget(K_CONFIG)) || {};
+  if(!fresh.qrToken || fresh.qrDate !== todayStr()){
+    const updated = { ...fresh, qrToken: genQrToken(), qrDate: todayStr() };
+    await sset(K_CONFIG, updated);
+    if(state.config) state.config = { ...state.config, ...updated };
+    return updated;
+  }
+  return fresh;
+}
 function fmtDate(iso){
   const [y,m,d] = iso.split('-');
   const bulan = ['Jan','Feb','Mar','Apr','Mei','Jun','Jul','Agu','Sep','Okt','Nov','Des'];
@@ -218,6 +229,9 @@ async function boot(){
   initFirebase();
   state.config = await sget(K_CONFIG);
   state.members = (await sget(K_MEMBERS)) || [];
+  if(state.config){
+    ensureTodayQrToken(); // fire-and-forget, tidak menunda render halaman
+  }
 
   const session = loadSession();
   if(session && session.role === 'admin' && state.config){
@@ -390,6 +404,7 @@ function renderAdminSetup(){
     const config = { name, adminPin, morningStart: ms, morningEnd: me, morningLateEnd: mle, eveningStart: es, eveningEnd: ee, eveningLateEnd: ele, lat, lng, radius };
     await sset(K_CONFIG, config);
     state.config = config;
+    ensureTodayQrToken(); // siapkan QR hari ini langsung, tidak perlu buka tab QR dulu
     saveSession({ role: 'admin' });
     state.view = 'adminDashboard';
     state.adminSubview = 'anggota';
@@ -1161,11 +1176,7 @@ function renderAnggota(body){
 
 async function renderQr(body){
   body.innerHTML = `<div class="empty">Memuat QR…</div>`;
-  let fresh = await sget(K_CONFIG);
-  if(!fresh.qrToken || fresh.qrDate !== todayStr()){
-    fresh = { ...fresh, qrToken: genQrToken(), qrDate: todayStr() };
-    await sset(K_CONFIG, fresh);
-  }
+  const fresh = await ensureTodayQrToken();
   state.config = fresh;
 
   const card = document.createElement('div');
