@@ -10,6 +10,7 @@
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js" onerror="window.__jsQrLoadFailed = true;"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <style>
   :root{
     --bg:#F3EFE4;
@@ -113,6 +114,76 @@ function initFirebase(){
   db = firebase.firestore();
 }
 
+/* ---------- BACKUP OTOMATIS (Firestore) ----------
+   Cadangan disimpan sebagai dokumen terpisah di koleksi "backups" pada project
+   Firebase yang sama (satu dokumen per tanggal). Tidak perlu setup tambahan apa pun,
+   karena memakai koneksi Firestore yang sudah aktif untuk data absensi.
+*/
+const BACKUP_COLLECTION = 'backups';
+const LAST_BACKUP_KEY = 'kkm_last_backup';
+
+function getLastBackupInfo(){
+  try{ return JSON.parse(localStorage.getItem(LAST_BACKUP_KEY) || 'null'); } catch(e){ return null; }
+}
+function setLastBackupInfo(info){
+  try{ localStorage.setItem(LAST_BACKUP_KEY, JSON.stringify(info)); } catch(e){}
+}
+
+async function gatherBackupData(){
+  const members = state.members || (await sget(K_MEMBERS)) || [];
+  const permits = (await sget(K_PERMITS)) || [];
+  const attendance = {};
+  for(const m of members){
+    attendance[m.id] = (await sget(attKey(m.id))) || [];
+  }
+  return { exportedAt: new Date().toISOString(), config: state.config, members, permits, attendance };
+}
+
+/* Simpan cadangan hari ini (menimpa cadangan hari yang sama kalau dipanggil berkali-kali) */
+async function backupNow(){
+  const data = await gatherBackupData();
+  const docId = todayStr();
+  await db.collection(BACKUP_COLLECTION).doc(docId).set({
+    value: JSON.stringify(data),
+    savedAt: new Date().toISOString(),
+  });
+  const info = { date: docId, time: nowHMS() };
+  setLastBackupInfo(info);
+  return info;
+}
+
+/* Dipanggil tiap admin buka dashboard: backup otomatis kalau hari ini belum pernah */
+function autoBackupIfDue(){
+  const last = getLastBackupInfo();
+  if(last && last.date === todayStr()) return;
+  backupNow().catch(e => console.error('auto backup gagal', e));
+}
+
+/* Ambil daftar cadangan yang tersimpan (terbaru dulu), maksimal `limit` */
+async function listBackups(limit){
+  const snap = await db.collection(BACKUP_COLLECTION).orderBy(firebase.firestore.FieldPath.documentId(), 'desc').limit(limit || 30).get();
+  return snap.docs.map(d => ({ id: d.id, savedAt: (d.data() || {}).savedAt || null }));
+}
+
+/* Pulihkan data dari salah satu dokumen cadangan, menimpa data yang sedang aktif */
+async function restoreBackup(docId){
+  const doc = await db.collection(BACKUP_COLLECTION).doc(docId).get();
+  if(!doc.exists) throw new Error('Cadangan tidak ditemukan.');
+  const raw = doc.data().value;
+  const data = JSON.parse(raw);
+  if(data.config) await sset(K_CONFIG, data.config);
+  if(data.members) await sset(K_MEMBERS, data.members);
+  if(data.permits) await sset(K_PERMITS, data.permits);
+  if(data.attendance){
+    for(const memberId of Object.keys(data.attendance)){
+      await sset(attKey(memberId), data.attendance[memberId]);
+    }
+  }
+  state.config = data.config || state.config;
+  state.members = data.members || state.members;
+  return data;
+}
+
 /* ---------- storage helpers (Firestore-backed, same key/value shape as before) ---------- */
 const K_CONFIG = 'kkm_config';
 const K_MEMBERS = 'kkm_members';
@@ -197,6 +268,32 @@ function findApprovedIzin(permits, memberId, date, period){
 function escCsv(v){
   const s = String(v ?? '');
   return /[",\n]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s;
+}
+
+/* ---------- export Excel (xlsx), 1 sheet per tanggal ---------- */
+function excelSheetNameFromDate(iso){
+  // "YYYY-MM-DD" -> "DD-MM-YYYY": aman untuk nama sheet Excel (tanpa \ / ? * [ ] :, maks 31 karakter)
+  const [y, m, d] = iso.split('-');
+  return `${d}-${m}-${y}`;
+}
+function exportRowsToXlsxByDate(rowsByDate, header, fileNamePrefix){
+  if(!window.XLSX){
+    alert('Gagal memuat pustaka export Excel. Cek koneksi internet, lalu muat ulang halaman dan coba lagi.');
+    return;
+  }
+  const dates = Object.keys(rowsByDate).sort(); // urut kronologis, tanggal terlama sheet paling awal
+  if(dates.length === 0) return;
+  const wb = XLSX.utils.book_new();
+  const usedNames = new Set();
+  dates.forEach(date => {
+    let name = excelSheetNameFromDate(date);
+    let n = name, i = 2;
+    while(usedNames.has(n)){ n = name + '-' + (i++); } // jaga-jaga kalau ada nama sheet bentrok
+    usedNames.add(n);
+    const ws = XLSX.utils.aoa_to_sheet([header, ...rowsByDate[date]]);
+    XLSX.utils.book_append_sheet(wb, ws, n);
+  });
+  XLSX.writeFile(wb, `${fileNamePrefix}-${todayStr()}.xlsx`);
 }
 
 /* ---------- state ---------- */
@@ -906,6 +1003,7 @@ function showStamp(record){
 
 /* ---------- ADMIN DASHBOARD ---------- */
 function renderAdminDashboard(){
+  autoBackupIfDue();
   const wrap = document.createElement('div');
   const topBar = document.createElement('div');
   topBar.style = 'display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px;';
@@ -981,7 +1079,7 @@ function renderRekapDetail(body, rows){
   card.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
       <div class="eyebrow">Detail Per Sesi</div>
-      <button class="btn btn-outline" id="btn_export" style="width:auto;padding:8px 12px;font-size:12.5px;">⬇ Export CSV</button>
+      <button class="btn btn-outline" id="btn_export" style="width:auto;padding:8px 12px;font-size:12.5px;">⬇ Export Excel</button>
     </div>
     ${flaggedCount > 0 ? `<div class="banner banner-danger">⚠ Ada ${flaggedCount} absen yang tercatat meski izin sudah disetujui di tanggal &amp; sesi yang sama — cek kemungkinan joki di baris bertanda ⚠ di bawah.</div>` : ''}
   ` + (
@@ -1001,18 +1099,14 @@ function renderRekapDetail(body, rows){
 
   document.getElementById('btn_export').onclick = () => {
     const header = ['Nama','Tanggal','Periode','Jam','Status','Jarak(m)','Latitude','Longitude','IndikasiJoki'];
-    const lines = [header.join(',')];
+    const rowsByDate = {};
     rows.forEach(r => {
       const status = !r.valid ? 'Luar Radius' : (r.late ? 'Telat' : 'Hadir');
-      lines.push([r.name, r.date, r.period, r.time, status, r.distance, r.lat, r.lng, r.joki ? 'YA' : ''].map(escCsv).join(','));
+      (rowsByDate[r.date] = rowsByDate[r.date] || []).push(
+        [r.name, fmtDate(r.date), r.period, r.time, status, r.distance, r.lat, r.lng, r.joki ? 'YA' : '']
+      );
     });
-    const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'rekap-detail-' + todayStr() + '.csv';
-    a.click();
-    URL.revokeObjectURL(url);
+    exportRowsToXlsxByDate(rowsByDate, header, 'rekap-detail');
   };
 }
 
@@ -1047,7 +1141,7 @@ function renderRekapKesimpulan(body, rows, approvedIzin){
   card.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
       <div class="eyebrow">Kesimpulan Kehadiran Harian</div>
-      <button class="btn btn-outline" id="btn_export_kesimpulan" style="width:auto;padding:8px 12px;font-size:12.5px;">⬇ Export CSV</button>
+      <button class="btn btn-outline" id="btn_export_kesimpulan" style="width:auto;padding:8px 12px;font-size:12.5px;">⬇ Export Excel</button>
     </div>
     <p class="small muted" style="margin-bottom:10px;">Gabungan sesi pagi &amp; sore jadi satu status harian — ini yang dipakai untuk laporan kehadiran.</p>
     ${flaggedCount > 0 ? `<div class="banner banner-danger">⚠ Ada ${flaggedCount} hari dengan indikasi joki (absen tercatat meski izin sudah disetujui).</div>` : ''}
@@ -1079,24 +1173,18 @@ function renderRekapKesimpulan(body, rows, approvedIzin){
 
   document.getElementById('btn_export_kesimpulan').onclick = () => {
     const header = ['Nama','Tanggal','Kesimpulan','Pagi','JamPagi','Sore','JamSore','IndikasiJoki'];
-    const lines = [header.join(',')];
+    const rowsByDate = {};
     summaryRows.forEach(r => {
       const pTxt = r.pStatus === 'invalid' ? 'Luar Radius' : r.pStatus === 'late' ? 'Telat' : r.pStatus === 'ontime' ? 'Hadir' : r.pStatus === 'izin' ? 'Izin' : '-';
       const sTxt = r.sStatus === 'invalid' ? 'Luar Radius' : r.sStatus === 'late' ? 'Telat' : r.sStatus === 'ontime' ? 'Hadir' : r.sStatus === 'izin' ? 'Izin' : '-';
-      lines.push([
-        r.name, r.date, r.summary.text,
+      (rowsByDate[r.date] = rowsByDate[r.date] || []).push([
+        r.name, fmtDate(r.date), r.summary.text,
         pTxt, r.pagi ? r.pagi.time : '',
         sTxt, r.sore ? r.sore.time : '',
         r.joki ? 'YA' : ''
-      ].map(escCsv).join(','));
+      ]);
     });
-    const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'rekap-kesimpulan-' + todayStr() + '.csv';
-    a.click();
-    URL.revokeObjectURL(url);
+    exportRowsToXlsxByDate(rowsByDate, header, 'rekap-kesimpulan');
   };
 }
 
@@ -1252,6 +1340,82 @@ async function renderQr(body){
   };
 }
 
+function renderDriveBackupCard(body){
+  const card = document.createElement('div');
+  card.className = 'card stack';
+
+  function statusLine(){
+    const last = getLastBackupInfo();
+    return last
+      ? `<div class="small muted">Backup terakhir: ${fmtDate(last.date)} pukul ${last.time}.</div>`
+      : `<div class="small muted">Belum pernah backup di perangkat ini. Backup otomatis akan berjalan begitu tab ini dibuka.</div>`;
+  }
+
+  card.innerHTML = `
+    <div class="eyebrow">Backup Otomatis</div>
+    <p class="small muted" style="margin:0;">Data (anggota, absensi, izin, pengaturan) otomatis dicadangkan ke Firestore setiap hari, begitu admin membuka dashboard. Tidak perlu setup atau login tambahan apa pun.</p>
+    <div id="backup_status_line">${statusLine()}</div>
+    <div id="backup_action_err"></div>
+    <button class="btn btn-outline" id="btn_backup_now">Backup Sekarang</button>
+    <div class="eyebrow" style="margin-top:6px;">Riwayat Cadangan</div>
+    <div id="backup_list" class="small muted">Memuat daftar cadangan…</div>
+  `;
+  body.appendChild(card);
+
+  async function refreshBackupList(){
+    const listEl = document.getElementById('backup_list');
+    try{
+      const backups = await listBackups(30);
+      if(!backups.length){ listEl.innerHTML = 'Belum ada cadangan tersimpan.'; return; }
+      listEl.innerHTML = backups.map(b => `
+        <div class="row" style="align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);">
+          <span>${fmtDate(b.id)}</span>
+          <button class="btn btn-outline btn-restore" data-id="${b.id}" style="width:auto;padding:6px 12px;font-size:12px;">Pulihkan</button>
+        </div>
+      `).join('');
+      listEl.querySelectorAll('.btn-restore').forEach(btn => {
+        btn.onclick = async () => {
+          const id = btn.getAttribute('data-id');
+          if(!confirm(`Pulihkan data dari cadangan tanggal ${fmtDate(id)}? Ini akan MENIMPA data anggota, absensi, izin, dan pengaturan yang sedang aktif sekarang.`)) return;
+          btn.disabled = true;
+          btn.textContent = 'Memulihkan…';
+          try{
+            await restoreBackup(id);
+            document.getElementById('backup_action_err').innerHTML = '<div class="banner banner-green" style="margin-top:8px;">Data berhasil dipulihkan. Memuat ulang halaman…</div>';
+            setTimeout(() => location.reload(), 1200);
+          } catch(e){
+            document.getElementById('backup_action_err').innerHTML = `<div class="banner banner-danger" style="margin-top:8px;">${e.message}</div>`;
+            btn.disabled = false;
+            btn.textContent = 'Pulihkan';
+          }
+        };
+      });
+    } catch(e){
+      listEl.innerHTML = 'Gagal memuat daftar cadangan: ' + e.message;
+    }
+  }
+  refreshBackupList();
+
+  document.getElementById('btn_backup_now').onclick = async () => {
+    const errEl = document.getElementById('backup_action_err');
+    const btn = document.getElementById('btn_backup_now');
+    btn.disabled = true;
+    btn.textContent = 'Membackup…';
+    errEl.innerHTML = '';
+    try{
+      await backupNow();
+      document.getElementById('backup_status_line').innerHTML = statusLine();
+      errEl.innerHTML = `<div class="banner banner-green" style="margin-top:8px;">Backup berhasil disimpan.</div>`;
+      refreshBackupList();
+    } catch(e){
+      errEl.innerHTML = `<div class="banner banner-danger" style="margin-top:8px;">${e.message}</div>`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Backup Sekarang';
+    }
+  };
+}
+
 function renderPengaturan(body){
   body.innerHTML = '';
   const c = state.config;
@@ -1284,6 +1448,8 @@ function renderPengaturan(body){
     <button class="btn btn-primary" id="btn_save">Simpan Perubahan</button>
   `;
   body.appendChild(card);
+
+  renderDriveBackupCard(body);
 
   document.getElementById('btn_locate').onclick = () => {
     const statusEl = document.getElementById('loc_status');
