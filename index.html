@@ -596,7 +596,7 @@ async function renderMemberDashboard(){
   const scanCard = document.createElement('div');
   scanCard.className = 'card';
   const { period, status: periodStatus } = getPeriodStatus(state.config);
-  const alreadyForPeriod = period ? todayRecs.find(r => r.period === period) : null;
+  const alreadyForPeriod = period ? latestForPeriod(todayRecs, period) : null;
   const izinPagi = findApprovedIzin(permits, state.currentMember.id, todayStr(), 'pagi');
   const izinSore = findApprovedIzin(permits, state.currentMember.id, todayStr(), 'sore');
   const approvedIzinForCurrentPeriod = period === 'pagi' ? izinPagi : (period === 'sore' ? izinSore : null);
@@ -605,12 +605,15 @@ async function renderMemberDashboard(){
   let btnDisabled = false;
   let btnClass = 'btn-primary';
   if(!period){ btnDisabled = true; btnLabel = 'Belum Waktu Absen'; }
-  else if(alreadyForPeriod){
+  else if(alreadyForPeriod && alreadyForPeriod.valid){
     btnDisabled = true;
     btnLabel = 'Sudah Absen ' + (period === 'pagi' ? 'Pagi' : 'Sore') + (alreadyForPeriod.late ? ' (Telat)' : '');
   } else if(approvedIzinForCurrentPeriod){
     btnDisabled = true;
     btnLabel = 'Sedang Izin ' + (period === 'pagi' ? 'Pagi' : 'Sore');
+  } else if(alreadyForPeriod && !alreadyForPeriod.valid){
+    btnLabel = '🔄 Coba Scan Ulang (Tadi Luar Radius)';
+    btnClass = 'btn-clay';
   } else if(periodStatus === 'late'){
     btnLabel = 'Absen Sekarang (Telat)';
     btnClass = 'btn-clay';
@@ -621,7 +624,8 @@ async function renderMemberDashboard(){
     ${periodCardHtml('pagi', todayRecs, state.config, izinPagi)}
     ${periodCardHtml('sore', todayRecs, state.config, izinSore)}
     <button class="btn ${btnDisabled ? 'btn-outline' : btnClass}" id="btn_scan" ${btnDisabled ? 'disabled' : ''} style="margin-top:6px;">${btnLabel}</button>
-    <div class="small muted" style="margin-top:8px;">${btnDisabled ? '' : 'Anda akan diminta memindai QR di lokasi, lalu izin lokasi.'}</div>
+    <button class="btn btn-ghost" id="btn_check_distance" type="button" style="margin-top:6px;">📍 Cek Jarak Saya dari Lokasi</button>
+    <div class="small muted" style="margin-top:8px;">${btnDisabled ? '' : (alreadyForPeriod && !alreadyForPeriod.valid ? 'Percobaan sebelumnya tercatat di luar radius (' + alreadyForPeriod.distance + 'm). Anda bisa coba scan ulang kalau sudah lebih dekat.' : 'Anda akan diminta memindai QR di lokasi, lalu izin lokasi.')}</div>
     <div id="scan_status" class="small muted" style="margin-top:4px;"></div>
   `;
   wrap.appendChild(scanCard);
@@ -649,6 +653,23 @@ async function renderMemberDashboard(){
   if(!btnDisabled){
     document.getElementById('btn_scan').onclick = () => openQrScanner(() => finalizeScan(records));
   }
+
+  document.getElementById('btn_check_distance').onclick = () => {
+    const el = document.getElementById('scan_status');
+    if(!navigator.geolocation){ el.textContent = 'Perangkat tidak mendukung geolocation.'; return; }
+    el.textContent = 'Mengambil lokasi…';
+    navigator.geolocation.getCurrentPosition(
+      pos => {
+        const dist = Math.round(haversine(pos.coords.latitude, pos.coords.longitude, state.config.lat, state.config.lng));
+        const inRange = dist <= state.config.radius;
+        el.innerHTML = inRange
+          ? `<span style="color:var(--accent-green);">Anda ~${dist}m dari lokasi KKM — dalam radius (maks ${state.config.radius}m). Bisa absen.</span>`
+          : `<span style="color:var(--danger);">Anda ~${dist}m dari lokasi KKM — di luar radius (maks ${state.config.radius}m). Dekati lokasi lalu coba lagi.</span>`;
+      },
+      err => { el.textContent = 'Gagal mengambil lokasi: ' + err.message; },
+      { enableHighAccuracy: true, timeout: 12000 }
+    );
+  };
 }
 
 /* ---------- MEMBER: kartu ajukan & riwayat izin ---------- */
@@ -720,15 +741,22 @@ function izinStatusPill(p){
   return `<span class="pill pill-muted">Menunggu</span>`;
 }
 
+function latestForPeriod(recs, period){
+  for(let i = recs.length - 1; i >= 0; i--){
+    if(recs[i].period === period) return recs[i];
+  }
+  return null;
+}
+
 function periodCardHtml(period, todayRecs, config, approvedIzin){
-  const rec = todayRecs.find(r => r.period === period);
+  const rec = latestForPeriod(todayRecs, period);
   const label = period === 'pagi' ? 'Pagi' : 'Sore';
   const start = period === 'pagi' ? config.morningStart : config.eveningStart;
   const end = period === 'pagi' ? config.morningEnd : config.eveningEnd;
   const lateEnd = (period === 'pagi' ? config.morningLateEnd : config.eveningLateEnd) || end;
   const window = `${start}–${end}` + (lateEnd !== end ? ` <span class="muted">(telat s.d ${lateEnd})</span>` : '');
   let right;
-  if(rec) right = statusPill(rec) + ` <span class="mono small muted">${rec.time}</span>`;
+  if(rec) right = statusPill(rec) + ` <span class="mono small muted">${rec.time}</span>` + (!rec.valid ? ` <span class="small" style="color:var(--danger);">· bisa scan ulang</span>` : '');
   else if(approvedIzin) right = `<span class="pill pill-muted">Izin</span>`;
   else right = `<span class="pill pill-muted">${window}</span>`;
   return `<div class="period-card"><div class="label">${label}</div><div>${right}</div></div>`;
@@ -968,7 +996,7 @@ async function finalizeScan(existingRecords){
       };
       const updated = [...existingRecords, record];
       await sset(attKey(state.currentMember.id), updated);
-      showStamp(record);
+      showStamp(record, updated);
     },
     err => {
       statusEl.textContent = 'Gagal mengambil lokasi: ' + err.message;
@@ -978,20 +1006,22 @@ async function finalizeScan(existingRecords){
   );
 }
 
-function showStamp(record){
+function showStamp(record, recordsForRetry){
   const overlay = document.createElement('div');
   overlay.className = 'stamp-overlay';
   const label = record.period === 'pagi' ? 'PAGI' : 'SORE';
   const stampWord = !record.valid ? 'DI LUAR<br>RADIUS' : (record.late ? 'HADIR<br>(TELAT)' : 'HADIR');
   const titleWord = !record.valid ? 'Absen ' + label + ' Tercatat' : (record.late ? 'Absen ' + label + ' Tercatat (Telat)' : 'Absen ' + label + ' Berhasil');
+  const canRetry = !record.valid;
   overlay.innerHTML = `
     <div class="stamp-card">
       <div class="stamp ${record.valid ? (record.late ? 'bad' : 'ok') : 'bad'}"><span>${stampWord}</span></div>
       <h3 style="font-size:18px;">${titleWord}</h3>
-      <p class="small muted mono" style="margin-top:6px;">${record.time} · jarak ${record.distance}m</p>
-      ${!record.valid ? '<p class="small" style="margin-top:8px;color:var(--danger);">Anda berada di luar radius ' + state.config.radius + 'm dari titik KKM.</p>' : ''}
+      <p class="small muted mono" style="margin-top:6px;">${record.time} · jarak ${record.distance}m dari lokasi (radius diizinkan ${state.config.radius}m)</p>
+      ${!record.valid ? '<p class="small" style="margin-top:8px;color:var(--danger);">Anda berada di luar radius ' + state.config.radius + 'm dari titik KKM. Absen tetap tercatat, tapi Anda bisa coba scan ulang setelah lebih dekat ke lokasi supaya tercatat hadir.</p>' : ''}
       ${record.valid && record.late ? '<p class="small" style="margin-top:8px;color:var(--accent-clay);">Absen tercatat, tapi di luar jam tepat waktu.</p>' : ''}
-      <button class="btn btn-primary" id="btn_close_stamp" style="margin-top:18px;">Tutup</button>
+      ${canRetry ? '<button class="btn btn-clay" id="btn_retry_scan" style="margin-top:14px;">🔄 Coba Scan Ulang</button>' : ''}
+      <button class="btn btn-primary" id="btn_close_stamp" style="margin-top:10px;">Tutup</button>
     </div>
   `;
   document.body.appendChild(overlay);
@@ -999,6 +1029,12 @@ function showStamp(record){
     document.body.removeChild(overlay);
     render();
   };
+  if(canRetry){
+    document.getElementById('btn_retry_scan').onclick = () => {
+      document.body.removeChild(overlay);
+      openQrScanner(() => finalizeScan(recordsForRetry));
+    };
+  }
 }
 
 /* ---------- ADMIN DASHBOARD ---------- */
